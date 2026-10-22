@@ -424,8 +424,8 @@ $('va').onclick=e=>{
 const cellCircle=L.circle([0,0],{
  radius:500,color:'#ffad32',weight:3,fillColor:'#ffad32',fillOpacity:.12
 });
-function showCell(lat,lon,acc){
- if(st.lastGood&&Date.now()-st.lastGood<60000)return;
+function showCell(lat,lon,acc,force){
+ if(!force&&st.lastGood&&Date.now()-st.lastGood<60000)return;
  const first=!map.hasLayer(cellCircle);
  cellCircle.setLatLng([lat,lon]).setRadius(acc||500);
  if(first){cellCircle.addTo(map);map.setView([lat,lon],15)}
@@ -537,12 +537,12 @@ function tip(p){
  marker.setTooltipContent(e);
 }
 function render(){
- const now=Date.now(),on=st.last&&now-st.last<15000,p=st.trail[st.trail.length-1];
+ const now=Date.now(),on=st.last&&now-st.last<(st.hasFix===false?150000:15000),p=st.trail[st.trail.length-1];
  $('onl').textContent=on?'Online':'Offline';$('onl').className='pill'+(on?'':' r');
  $('cdot').style.background=on?'var(--grn)':'var(--red)';
  $('ctext').textContent=on?'Connected':(st.last?'No data':'Not connected');
  $('lu').textContent=st.last?fmt(st.last):'--';$('dLu').textContent=st.last?fmt(st.last):'--';
- if(p){
+ if(p&&st.link!=='Cell tower'){
   const ll=p.lat.toFixed(5)+'°, '+p.lon.toFixed(5)+'°';
   $('cLoc').textContent=st.place||'Live position';$('cLL').textContent=ll;
   $('dLoc').textContent=st.place||ll;tip(p);
@@ -939,15 +939,16 @@ function startFirebase(){
   alert('Firebase is not set up yet. Open index.html, paste your Firebase config into FIREBASE_CONFIG, and reload.');
   return false;
  }
- API='';st.mode='firebase';st.stopped=false;
+ API='';st.mode='firebase';st.stopped=false;st.fbLiveT=0;st.fbCellT=0;
  window.fb.history(300).then(h=>{if(h.length)loadHistory('',h)}).catch(e=>console.warn('Firebase history failed:',e));
  st.fbUnsub=window.fb.listen(
   v=>{
    if(st.stopped)return;
    if(v.fix===1&&Number.isFinite(v.lat)&&Number.isFinite(v.lon)){
+    if(st.fbCellT&&v.t&&st.fbCellT>v.t)return;   // a newer cell-tower position exists
     ingest({fix:1,lat:v.lat,lon:v.lon,spd:v.spd,sats:v.sats,sos:v.sos,
      bat:v.bat,rssi:v.rssi,g:v.g,link:'Firebase'});
-    if(v.t){st.last=v.t;st.lastGood=v.t}
+    if(v.t){st.last=v.t;st.lastGood=v.t;st.fbLiveT=v.t}
    }
   },
   e=>{
@@ -955,6 +956,14 @@ function startFirebase(){
    const text=e.alert||'SOS button pressed on the tracker.';
    const type=e.sos?'sos':/RESTORED|SPEED OK|BACK|FIX OK|ENTERED|CANCELLED/i.test(text)?'info':'warn';
    addAlert(type,text);
+  },
+  cv=>{
+   if(st.stopped)return;
+   if(!Number.isFinite(cv.clat)||!Number.isFinite(cv.clon))return;
+   if(cv.t&&st.fbLiveT&&cv.t<=st.fbLiveT)return;   // GPS data is newer
+   if(cv.t){st.fbCellT=cv.t;st.last=cv.t}
+   st.hasFix=false;st.sats=null;st.link='Cell tower';
+   showCell(cv.clat,cv.clon,cv.cacc,true);
   }
  );
  $('ctext').textContent='Listening to Firebase';
@@ -1020,11 +1029,11 @@ renderAlerts();render();renderZones();
    2. Paste the values below (databaseURL is shown after you create a Realtime Database).
    Until the values are filled in, Firebase stays switched off and everything else works as before. */
 const FIREBASE_CONFIG={
- apiKey:"AIzaSyC3JQxPFufKNqFHuCDtKjuwhL62Bq0AJc8",
- authDomain:"safetrack-47933.firebaseapp.comm",
+ apiKey:"YOUR_API_KEY",
+ authDomain:"safetrack-47933.firebaseapp.com",
  databaseURL:"https://safetrack-47933-default-rtdb.asia-southeast1.firebasedatabase.app",
  projectId:"safetrack-47933",
- appId:"1:25347086938:web:11f7e4b188859eb6a21663"
+ appId:"YOUR_APP_ID"
 };
 const DEVICE_ID='trk_k8f3q92xz7d1m6';       // use a different id per tracker
 const HISTORY_EVERY_MS=5000;      // how often a point is saved to history (only used if UPLOAD_FROM_USB is true)
@@ -1075,12 +1084,13 @@ if(FIREBASE_CONFIG.apiKey&&!FIREBASE_CONFIG.apiKey.startsWith('YOUR_')){
     return out;
    },
    /* Subscribe to live position and alert events. Returns an unsubscribe function. */
-   listen(onLive,onEvent){
+   listen(onLive,onEvent,onCell){
     let off=[],dead=false;
     authP.then(()=>{
      if(dead)return;
      const fail=e=>{console.warn('Firebase read failed:',e);window.toast&&window.toast('Firebase read failed: '+(e.code||e.message))};
      off.push(onValue(ref(db,base+'/live'),s=>{const v=s.val();if(v)onLive(v)},fail));
+     off.push(onValue(ref(db,base+'/cell'),s=>{const v=s.val();if(v&&onCell)onCell(v)},fail));
      const t0=Date.now();
      off.push(onChildAdded(query(ref(db,base+'/events'),limitToLast(1)),s=>{
       const v=s.val();if(v&&v.t>t0-30000)onEvent(v);
