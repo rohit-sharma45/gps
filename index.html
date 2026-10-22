@@ -137,6 +137,7 @@ svg{width:100%;height:170px;display:block;background:#0c1730;border-radius:8px}
   <option value="demo">Demo (simulated)</option>
   <option value="serial">USB serial (real board)</option>
   <option value="server">Server URL</option>
+  <option value="firebase">Firebase (live from cloud)</option>
  </select>
  <input id="url" placeholder="Backend URL (optional for local USB)" style="display:none;width:260px">
  <button id="go" class="pri">Start</button>
@@ -770,6 +771,12 @@ $('rep').onclick=e=>{
 
 /* Parse lines from the tracker serial output and optionally forward them to the server. */
 function forwardTelemetry(p){
+ if(window.fb&&window.fb.ready&&window.fb.uploadFromUsb){
+  window.fb.send(p).catch(e=>{
+   console.warn('Firebase upload failed:',e);
+   if(!forwardTelemetry.warned){forwardTelemetry.warned=true;toast('Firebase upload failed: '+(e.code||e.message))}
+  });
+ }
  if(!API)return;
  fetch(API+'/api/telemetry',{
   method:'POST',
@@ -798,7 +805,7 @@ function parseLine(s){
  if(m){
   if(/GPS LOST/i.test(m[1]))st.gpsLost=true;
   if(/GPS RESTORED/i.test(m[1]))st.gpsLost=false;
-  const type=/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK/i.test(m[1])?'info':'warn';
+  const type=/SOS/i.test(m[1])?'sos':/RESTORED|SPEED OK|BACK|FIX OK|ENTERED|CANCELLED/i.test(m[1])?'info':'warn';
   addAlert(type,m[1]);
   forwardTelemetry({alert:m[1],sos:type==='sos',fix:st.hasFix?1:0});
   return;
@@ -869,6 +876,7 @@ async function startSerial(){
 async function stopTracking(){
  st.stopped=true;
  if(st.timer){clearInterval(st.timer);st.timer=null;}
+ if(st.fbUnsub){try{st.fbUnsub()}catch(e){} st.fbUnsub=null;}
  const rd=st.serialReader;
  st.serialReader=null;
  if(rd){
@@ -892,9 +900,9 @@ async function stopTracking(){
  $('ctext').textContent='Stopped';$('cdot').style.background='var(--red)';
  toast('Tracking stopped. Demo will not restart automatically.');
 }
-async function loadHistory(u){
+async function loadHistory(u,preloaded){
  try{
-  const h=await(await fetch(u+'/api/history')).json();
+  const h=preloaded||await(await fetch(u+'/api/history')).json();
   h.forEach(j=>{
    if(j.fix&&j.lat){
     const pt={lat:j.lat,lon:j.lon,spd:j.spd||0,t:j.t};
@@ -926,6 +934,32 @@ function startServer(){
  },2000);
  return true;
 }
+function startFirebase(){
+ if(!window.fb||!window.fb.ready){
+  alert('Firebase is not set up yet. Open index.html, paste your Firebase config into FIREBASE_CONFIG, and reload.');
+  return false;
+ }
+ API='';st.mode='firebase';st.stopped=false;
+ window.fb.history(300).then(h=>{if(h.length)loadHistory('',h)}).catch(e=>console.warn('Firebase history failed:',e));
+ st.fbUnsub=window.fb.listen(
+  v=>{
+   if(st.stopped)return;
+   if(v.fix===1&&Number.isFinite(v.lat)&&Number.isFinite(v.lon)){
+    ingest({fix:1,lat:v.lat,lon:v.lon,spd:v.spd,sats:v.sats,sos:v.sos,
+     bat:v.bat,rssi:v.rssi,g:v.g,link:'Firebase'});
+    if(v.t){st.last=v.t;st.lastGood=v.t}
+   }
+  },
+  e=>{
+   if(st.stopped)return;
+   const text=e.alert||'SOS button pressed on the tracker.';
+   const type=e.sos?'sos':/RESTORED|SPEED OK|BACK|FIX OK|ENTERED|CANCELLED/i.test(text)?'info':'warn';
+   addAlert(type,text);
+  }
+ );
+ $('ctext').textContent='Listening to Firebase';
+ return true;
+}
 function startDemo(){
  st.mode='demo';st.stopped=false;
  st.timer=setInterval(()=>{
@@ -950,7 +984,7 @@ $('src').onchange=()=>{
  $('url').placeholder=mode==='serial'?'Public backend URL to share GPS (optional)':'Backend URL, e.g. https://your-tunnel.trycloudflare.com';
 };
 $('go').onclick=async()=>{
- if(st.timer||st.dev){await stopTracking();return}
+ if(st.timer||st.dev||st.fbUnsub){await stopTracking();return}
  const s=$('src').value;
  st.stopped=false;
  if(s==='demo'){
@@ -958,6 +992,8 @@ $('go').onclick=async()=>{
  }else if(s==='serial'){
   const ok=await startSerial();
   if(ok)$('go').textContent='Stop';
+ }else if(s==='firebase'){
+  if(startFirebase()){$('go').textContent='Stop';$('src').disabled=true}
  }else{
   if(startServer()){$('go').textContent='Stop';$('src').disabled=true;$('url').disabled=true}
  }
@@ -977,6 +1013,87 @@ renderAlerts();render();renderZones();
  // Intentionally do not click Start automatically.
  // The user must explicitly choose a mode and press Start.
 })();
+</script>
+<script type="module">
+/* ============ FIREBASE SETUP ============
+   1. Firebase console > Project settings > Your apps > Web app > copy the config.
+   2. Paste the values below (databaseURL is shown after you create a Realtime Database).
+   Until the values are filled in, Firebase stays switched off and everything else works as before. */
+const FIREBASE_CONFIG={
+ apiKey:"AIzaSyC3JQxPFufKNqFHuCDtKjuwhL62Bq0AJc8",
+ authDomain:"safetrack-47933.firebaseapp.comm",
+ databaseURL:"https://safetrack-47933-default-rtdb.asia-southeast1.firebasedatabase.app",
+ projectId:"safetrack-47933",
+ appId:"1:25347086938:web:11f7e4b188859eb6a21663"
+};
+const DEVICE_ID='trk_k8f3q92xz7d1m6';       // use a different id per tracker
+const HISTORY_EVERY_MS=5000;      // how often a point is saved to history (only used if UPLOAD_FROM_USB is true)
+const UPLOAD_FROM_USB=false;      // false = the Arduino uploads to Firebase itself; the page only reads
+
+window.fb={ready:false};
+if(FIREBASE_CONFIG.apiKey&&!FIREBASE_CONFIG.apiKey.startsWith('YOUR_')){
+ try{
+  const {initializeApp}=await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js');
+  const {getAuth,signInAnonymously}=await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-auth.js');
+  const {getDatabase,ref,set,push:dbPush,get,query,limitToLast,onValue,onChildAdded}=
+   await import('https://www.gstatic.com/firebasejs/12.7.0/firebase-database.js');
+
+  const app=initializeApp(FIREBASE_CONFIG);
+  const db=getDatabase(app);
+  const authP=signInAnonymously(getAuth(app)).catch(e=>{
+   console.warn('Firebase anonymous sign-in failed (continuing without auth):',e.code||e.message);
+  });
+  const base='devices/'+DEVICE_ID;
+  let lastHist=0,firstOk=true;
+  const clean=o=>JSON.parse(JSON.stringify(o)); // drops undefined values, which Firebase rejects
+
+  window.fb={
+   ready:true,
+   uploadFromUsb:UPLOAD_FROM_USB,
+   /* Upload one telemetry object from the tracker. */
+   async send(p){
+    await authP;
+    const t=Date.now();
+    if(p.fix===1&&Number.isFinite(p.lat)&&Number.isFinite(p.lon)){
+     await set(ref(db,base+'/live'),clean({...p,t}));
+     if(t-lastHist>=HISTORY_EVERY_MS||p.sos){
+      lastHist=t;
+      await dbPush(ref(db,base+'/history'),clean({lat:p.lat,lon:p.lon,spd:p.spd||0,fix:1,sos:!!p.sos,t}));
+     }
+    }else if(p.clat!=null){
+     await set(ref(db,base+'/cell'),clean({...p,t}));
+    }else if(p.alert||p.sos){
+     await dbPush(ref(db,base+'/events'),clean({alert:p.alert||null,sos:!!p.sos,t}));
+    }
+    if(firstOk){firstOk=false;window.toast&&window.toast('Uploading GPS to Firebase')}
+   },
+   /* Last saved points, oldest first. */
+   async history(n){
+    await authP;
+    const snap=await get(query(ref(db,base+'/history'),limitToLast(n||300)));
+    const out=[];snap.forEach(c=>{out.push(c.val())});
+    return out;
+   },
+   /* Subscribe to live position and alert events. Returns an unsubscribe function. */
+   listen(onLive,onEvent){
+    let off=[],dead=false;
+    authP.then(()=>{
+     if(dead)return;
+     const fail=e=>{console.warn('Firebase read failed:',e);window.toast&&window.toast('Firebase read failed: '+(e.code||e.message))};
+     off.push(onValue(ref(db,base+'/live'),s=>{const v=s.val();if(v)onLive(v)},fail));
+     const t0=Date.now();
+     off.push(onChildAdded(query(ref(db,base+'/events'),limitToLast(1)),s=>{
+      const v=s.val();if(v&&v.t>t0-30000)onEvent(v);
+     },fail));
+    });
+    return ()=>{dead=true;off.forEach(f=>f());off=[]};
+   }
+  };
+ }catch(e){
+  console.error('Firebase failed to start:',e);
+  window.fb={ready:false};
+ }
+}
 </script>
 </body>
 </html>
